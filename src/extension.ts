@@ -5,10 +5,8 @@ import * as vscode from 'vscode';
 export async function activate(context: vscode.ExtensionContext) {
     let disposable = vscode.commands.registerCommand('dart-barrel-generator.generateBarrel', async (uri: vscode.Uri) => {
         try {
-            // Get the target folder
             if (!uri || !uri.fsPath) {
-                const message = 'Please right-click on a folder to generate a barrel file';
-                vscode.window.showErrorMessage(message);
+                vscode.window.showErrorMessage('Please right-click on a folder to generate a barrel file');
                 return;
             }
 
@@ -22,7 +20,6 @@ export async function activate(context: vscode.ExtensionContext) {
             const folderName = path.basename(folderPath);
             const barrelFilePath = path.join(folderPath, `${folderName}.dart`);
 
-            // Check if barrel file already exists
             try {
                 await fs.access(barrelFilePath);
                 const override = await vscode.window.showWarningMessage(
@@ -36,10 +33,20 @@ export async function activate(context: vscode.ExtensionContext) {
                 // File doesn't exist, which is fine
             }
 
-            // Start the barrel generation process
-            const exports = await generateExports(folderPath, folderPath);
-            const sortedExports = exports.sort((a, b) => a.localeCompare(b));
-            const fileContent = sortedExports.join('\n') + '\n';
+            // Collect all imports and exports
+            const { imports, exports } = await generateBarrelContent(folderPath, folderPath);
+            
+            // Remove duplicates and sort
+            const uniqueImports = Array.from(new Set(imports)).sort();
+            const uniqueExports = Array.from(new Set(exports)).sort();
+
+            // Combine imports and exports
+            const fileContent = [
+                ...uniqueImports.map(imp => `import '${imp}';`),
+                '', // Empty line between imports and exports
+                ...uniqueExports.map(exp => `export '${exp}';`),
+                '' // Final newline
+            ].join('\n');
 
             // Write the barrel file
             await fs.writeFile(barrelFilePath, fileContent, 'utf8');
@@ -61,22 +68,22 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(disposable);
 }
 
-async function generateExports(basePath: string, currentPath: string): Promise<string[]> {
+async function generateBarrelContent(basePath: string, currentPath: string): Promise<{ imports: string[], exports: string[] }> {
+    const imports: string[] = [];
     const exports: string[] = [];
     const files = await fs.readdir(currentPath, { withFileTypes: true });
 
     for (const file of files) {
         const filePath = path.join(currentPath, file.name);
         
-        // Skip hidden files and directories
         if (file.name.startsWith('.')) {
             continue;
         }
 
         if (file.isDirectory()) {
-            // Recursively process subdirectories
-            const subExports = await generateExports(basePath, filePath);
-            exports.push(...subExports);
+            const subContent = await generateBarrelContent(basePath, filePath);
+            imports.push(...subContent.imports);
+            exports.push(...subContent.exports);
         } else if (
             file.isFile() && 
             file.name.endsWith('.dart') && 
@@ -84,17 +91,27 @@ async function generateExports(basePath: string, currentPath: string): Promise<s
             !file.name.endsWith('.freezed.dart') &&
             !file.name.endsWith('.mocks.dart')
         ) {
-            // Skip generated files and the barrel file itself
-            const relativePath = path.relative(basePath, filePath);
             if (path.basename(filePath) !== path.basename(basePath) + '.dart') {
-                // Ensure forward slashes for Dart imports
+                const content = await fs.readFile(filePath, 'utf8');
+                
+                // Extract all imports
+                const importMatches = content.match(/import\s+'([^']+)';/g) || [];
+                const extractedImports = importMatches.map(imp => {
+                    const match = imp.match(/import\s+'([^']+)';/);
+                    return match ? match[1] : '';
+                }).filter(imp => imp);
+                
+                imports.push(...extractedImports);
+
+                // Add file to exports
+                const relativePath = path.relative(basePath, filePath);
                 const dartPath = relativePath.split(path.sep).join('/');
-                exports.push(`export '${dartPath}';`);
+                exports.push(dartPath);
             }
         }
     }
 
-    return exports;
+    return { imports, exports };
 }
 
 async function updateImports(basePath: string, barrelName: string, currentPath: string) {
@@ -103,13 +120,11 @@ async function updateImports(basePath: string, barrelName: string, currentPath: 
     for (const file of files) {
         const filePath = path.join(currentPath, file.name);
         
-        // Skip hidden files and directories
         if (file.name.startsWith('.')) {
             continue;
         }
 
         if (file.isDirectory()) {
-            // Recursively process subdirectories
             await updateImports(basePath, barrelName, filePath);
         } else if (
             file.isFile() && 
@@ -141,7 +156,15 @@ async function updateFileImports(filePath: string, basePath: string, barrelName:
                 
                 // Only update imports that are within the barrel's directory
                 if (!relativeToBase.startsWith('..') && !relativeToBase.includes('node_modules')) {
-                    const newImport = `import '${barrelName}.dart';`;
+                    // Calculate the relative path from the current file to the barrel file
+                    const relativeToBarrel = path.relative(
+                        path.dirname(filePath),
+                        path.join(basePath, `${barrelName}.dart`)
+                    );
+                    
+                    // Ensure proper path format for Dart imports
+                    const dartPath = relativeToBarrel.split(path.sep).join('/');
+                    const newImport = `import '${dartPath.startsWith('.') ? dartPath : './' + dartPath}';`;
                     content = content.replace(match[0], newImport);
                     modified = true;
                 }
